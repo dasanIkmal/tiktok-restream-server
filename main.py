@@ -1,3 +1,4 @@
+import atexit
 import yaml
 from httpclient import HttpClient
 import logger_manager
@@ -18,6 +19,12 @@ def config_properties():
     return channel_name, channel_id, proxy, channel_url
 
 
+def cleanup(httpclient, logger):
+    if httpclient:
+        httpclient.close_session()
+        logger.info("HTTP session closed")
+
+
 def main():
     url = None
     user = None
@@ -35,14 +42,16 @@ def main():
 
     httpclient = HttpClient(logger)
 
+    # Register the cleanup function to run when the program exits
+    atexit.register(cleanup, httpclient, logger)
+
     try:
         bot = TikTok(
             httpclient=httpclient,
             logger=logger,
             room_id=room_id,
             user=user,
-            url=url
-        )
+            url=url)
         bot.run()
     except Exception as ex:
         logger.error(f'Exception caught in main:\n{ex}')

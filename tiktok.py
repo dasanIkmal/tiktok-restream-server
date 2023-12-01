@@ -1,4 +1,3 @@
-import sys
 from requests import Session
 import requests as req
 import time
@@ -9,22 +8,37 @@ import cv2
 from httpclient import HttpClient
 from flask import Flask, Response
 import threading
+from threadedCamera import ThreadedCamera
 
 
-def generate_frames(cap):
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        _, jpeg = cv2.imencode('.jpg', frame)
-        frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+def generate_frames(threaded_camera, skip_frames):
+    """
+    Generate frames for streaming.
+    """
+    try:
+        while True:
+            frame_bytes = threaded_camera.get_frame()
+
+            if not frame_bytes:
+                # If frame is not available, yield an empty frame
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n\r\n\r\n')
+                continue
+
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n\r\n')
+
+            time.sleep(skip_frames * threaded_camera.FPS)
+
+    except Exception as e:
+        # Log any exceptions that might occur during frame generation
+        print(f"Error in generate_frames: {e}")
 
 
 class TikTok:
 
     def __init__(self, httpclient, logger, room_id=None, user=None, url=None):
+        self.camera = None
         self.logger = logger
         self.room_id = room_id
         self.user = user
@@ -50,54 +64,57 @@ class TikTok:
             if yes starting to display the stream
             if no just print user is not live at the moment
         """
-
         if not self.is_user_in_live():
             self.logger.info(f"{self.user} is not live at the moment ")
         else:
             self.logger.info(f"{self.user} is live, we can get the stream this is the chanel if {self.room_id}")
-            # threading.Thread(target=self.start_flask_app).start()
-            self.start_display_stream()
+            threading.Thread(target=self.start_flask_app).start()
 
-    def start_display_stream(self):
+    def start_flask_app(self):
+        app = Flask(__name__)
+        threaded_camera = ThreadedCamera(self.get_live_url())
+
+        @app.route('/')
+        def index():
+            return Response(generate_frames(threaded_camera, 5),
+                            mimetype='multipart/x-mixed-replace; boundary=frame')
+
+        app.run(host='0.0.0.0', port=5000, debug=False)
+
+
+    # def use_threaded_camera(self):
+    #     live_url = self.get_live_url()
+    #     threaded_camera = ThreadedCamera(live_url)
+    #     while True:
+    #         try:
+    #             threaded_camera.show_frame()
+    #         except AttributeError:
+    #             pass
+    #         except KeyboardInterrupt:
+    #             break
+
+    def start_display_stream(self, skip_frames=5):
         """
-            Start displaying the live stream locally
+        Start displaying the live stream locally
         """
         live_url = self.get_live_url()
-
         if not live_url:
             raise ValueError(Error.URL_NOT_FOUND)
 
         self.logger.info("STARTED STREAMING...")
 
         try:
-            cap = cv2.VideoCapture(live_url)
+            self.camera = ThreadedCamera(live_url)
 
-            if not cap.isOpened():
-                self.logger.error("Error opening video stream.")
-                sys.exit(1)
-
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
-
-            frame_width = int(cap.get(3))  # Get the width of the frames
-            frame_height = int(cap.get(4))  # Get the height of the frames
-
-            cv2.namedWindow('TikTok Live Stream', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('TikTok Live Stream', frame_width, frame_height)
-
-            self.logger.info("[PRESS 'q' TO STOP STREAMING]")
-
+            frame_counter = 0
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                frame_bytes = self.camera.get_frame()
 
-                cv2.imshow('TikTok Live Stream', frame)
+                if frame_counter % skip_frames == 0:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n\r\n')
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-            cap.release()
-            cv2.destroyAllWindows()
+                frame_counter += 1
 
         except KeyboardInterrupt:
             pass
@@ -105,28 +122,11 @@ class TikTok:
             if self.httpclient:
                 self.httpclient.close()
                 self.logger.info("HTTP session closed")
+            if self.camera:
+                self.camera.capture.release()
+                cv2.destroyAllWindows()
 
         self.logger.info("FINISHED STREAMING\n")
-
-    def generate_frames(self, cap):
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            _, jpeg = cv2.imencode('.jpg', frame)
-            frame = jpeg.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
-
-    def start_flask_app(self):
-        app = Flask(__name__)
-
-        @app.route('/')
-        def index():
-            return Response(generate_frames(cv2.VideoCapture(self.get_live_url())),
-                            mimetype='multipart/x-mixed-replace; boundary=frame')
-
-        app.run(host='0.0.0.0', port=5000, debug=False)
 
     def get_room_and_user_from_url(self):
         """
@@ -194,7 +194,7 @@ class TikTok:
             if 'This account is private' in json:
                 raise errors.AccountPrivate('Account is private, login required')
 
-            live_url_flv = json['data']['stream_url']['hls_pull_url']
+            live_url_flv = json['data']['stream_url']['rtmp_pull_url']
             self.logger.info(f"LIVE URL: {live_url_flv}")
 
             return live_url_flv
